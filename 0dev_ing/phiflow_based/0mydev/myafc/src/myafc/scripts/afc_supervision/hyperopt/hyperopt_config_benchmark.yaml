@@ -1,0 +1,153 @@
+# ============================================================
+# 超参数优化配置文件 - 遗传算法（基准测试）
+# ============================================================
+# 使用方法：
+#     # 正常运行
+#     python hyperopt_genetic.py --config hyperopt_config_benchmark.yaml
+#     python hyperopt_genetic.py --config hyperopt_config_benchmark.yaml --generations 20 --population 10
+#     # 从断点恢复
+#     python hyperopt_genetic.py --config hyperopt_config_benchmark.yaml --resume
+#
+# 本配置文件定义了:
+#   1. 基础训练配置路径
+#   2. 遗传算法参数
+#   3. 待优化的超参数及其范围
+# ============================================================
+
+# 基础训练配置文件路径（相对于脚本目录或绝对路径）
+base_config_path: "../../../configs/simple_trainer.yaml"
+
+# ============================================================
+# 遗传算法参数
+# ============================================================
+population_size: 8           # 种群大小（每代评估的配置数）
+generations: 15              # 进化代数
+mutation_rate: 0.25          # 变异概率 (0-1)
+mutation_scale: 0.2          # 变异幅度（相对于参数范围）
+crossover_rate: 0.8          # 交叉概率
+elite_ratio: 0.2             # 精英保留比例
+
+# ============================================================
+# 多目标优化配置
+# ============================================================
+# 优化目标列表（都是最小化）
+# 可选目标:
+#   - val_loss: 验证 loss（泛化能力）
+#   - loss_stability: 训练稳定性（综合指标，越小越稳定）
+#   - final_loss: 最终训练 loss
+#   - primary_loss_min: 最小训练 loss
+#   - monotonicity: 单调性（取负后最小化）
+objectives:
+  - val_loss
+  - loss_stability
+
+# 目标权重（加权求和计算综合适应度）
+objective_weights:
+  - 1.0      # val_loss 权重
+  - 1.0      # loss_stability 权重
+
+# ============================================================
+# 稳定性指标权重配置
+# ============================================================
+# loss_stability 指标设计说明：
+#   combined_stability = w_cv * CV + w_mono * (1 - monotonicity)
+#
+#   其中：
+#     - CV (变异系数) = std(loss) / (mean(loss) + 1e-6)
+#       衡量训练曲线的波动幅度，越小表示训练越平稳
+#
+#     - monotonicity = count(下降步) / 总步数
+#       衡量收敛趋势，越高表示 loss 越单调下降
+#       (1 - monotonicity) 使其可最小化
+#
+#   权重说明：
+#     - 默认 [0.7, 0.3]：CV 权重较高
+#     - 原因：CV 更直接反映训练波动程度；monotonicity 作为辅助
+#
+# stability_weights: [CV权重, (1-monotonicity)权重]
+stability_weights:
+  - 0.7      # CV 权重（波动幅度）
+  - 0.3      # (1-monotonicity) 权重（收敛趋势）
+
+num_interactions: 10
+
+# ============================================================
+# 输出配置
+# ============================================================
+output_dir: "runs/hyperopt"  # 相对工作目录的路径
+experiment_name: "genetic_opt_001"
+
+# ============================================================
+# 待优化超参数
+# ============================================================
+# 每个参数配置:
+#   - name: 参数名（支持嵌套，如 "training.learning_rate"）
+#   - min: 最小值
+#   - max: 最大值
+#   - log_scale: 是否使用对数缩放（适合学习率等跨多个数量级的参数）
+#   - discrete: 是否离散化（取整）
+#   - step: 步长（仅 discrete=true 时有效）
+# ============================================================
+
+hyperparams:
+  # 学习率 - 对数缩放
+  - name: "training.learning_rate"
+    min: 1e-5
+    max: 1e-2
+    log_scale: true
+    discrete: false
+  
+  # 策略稳定性正则化权重
+  - name: "loss.policy_stability_weight"
+    min: 0.0
+    max: 0.2
+    log_scale: false
+    discrete: false
+  
+  # 奖励权重衰减率
+  - name: "loss.reward_weight_decay_rate"
+    min: 0.01
+    max: 0.5
+    log_scale: false
+    discrete: false
+
+# ============================================================
+# 更多可选参数示例（取消注释以启用）
+# ============================================================
+
+#  # Batch 归一化动量
+#  - name: "training.bn_momentum"
+#    min: 0.01
+#    max: 0.3
+#    log_scale: false
+#    discrete: false
+#
+#  # 时间平滑正则化权重
+#  - name: "loss.temporal_smoothness_weight"
+#    min: 0.0
+#    max: 0.5
+#    log_scale: false
+#    discrete: false
+#
+#  # 熵正则化权重
+#  - name: "loss.entropy_weight"
+#    min: 0.0
+#    max: 0.1
+#    log_scale: false
+#    discrete: false
+#
+#  # 控制间隔（离散参数）
+#  - name: "env.control_interval"
+#    min: 1
+#    max: 20
+#    log_scale: false
+#    discrete: true
+#    step: 1
+#
+#  # Action Duration（离散参数）
+#  - name: "env.action_duration"
+#    min: 100
+#    max: 500
+#    log_scale: false
+#    discrete: true
+#    step: 50

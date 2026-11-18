@@ -1,0 +1,191 @@
+# =============================================================================
+# AFCValidator 完整配置模板 (含全部参数说明)
+# =============================================================================
+#
+# 验证引擎支持两种模型:
+#   - JetTrainer (.pt): 可微分训练模型
+#   - DRLTrainer (.zip): SB3 强化学习模型
+#
+# 使用方法:
+#   validator = AFCValidator(config="configs/val/val_benchmark.yaml")
+#   results = validator.run()
+#
+# 或命令行:
+#   cd examples/run_validator
+#   python run_validator.py cfgs/your_config.yaml
+#
+# =============================================================================
+
+# =============================================================================
+# 1. 路径配置 (必填)
+# =============================================================================
+
+# Trainer 配置文件路径
+# 用于解析环境配置、网络结构、目标探针位置等
+# 支持格式:
+#   - 相对路径 (相对于此文件)
+#   - 绝对路径
+#   - null: 自动从 model_path 推断
+#       JetTrainer: model_path/../configs/trainer_config.yaml
+#       DRLTrainer: model_path/../config.yaml (or ./config.yaml)
+trainer_config_path: null
+
+# 环境配置路径 (可选，覆盖 trainer_config 中的 env_config_path)
+# 当 trainer_config 中的 env_config_path 不可用时（如跨机器验证），可在此显式指定
+# 设置后将覆盖 trainer_config 中的 env_config_path
+# 相对于此文件解析
+# 设为 null 时自动使用 trainer_config 同目录下的 solver_config.yaml（如存在）
+env_config_path: null
+
+# 模型文件路径 (必填)
+# 自动检测格式:
+#   .pt  → JetTrainer 模型 (AFCAgent 权重)
+#   .zip → DRLTrainer 模型 (SB3 SAC/PPO/TD3)
+model_path: "../../runs/afc_jet_train/exp/checkpoints/best.pt"
+
+# =============================================================================
+# 2. 验证参数
+# =============================================================================
+
+# 模型类型
+# 可选值:
+#   'jet': 强制 JetTrainer 模式
+#   'drl': 强制 DRLTrainer 模式
+model_type: auto
+
+# 预热步数 (env-steps / CFD steps)
+# 预热阶段行为:
+#   - 填充历史 buffer (envstep_state, include_prev_amplitude_num)
+#   - 不计入统计 (Cd/Cl 等)
+#   - Runner 仍会记录 force_coeffs.csv (用于时序完整性)
+warmup_steps: 3
+
+# 正式验证步数 (env-steps / CFD steps)
+# 此步数内的数据计入 validation_curves.npz/csv 统计
+validation_steps: 124
+
+# 确定性策略
+# 可选值:
+#   false: 使用采样动作（含随机性，用于探索行为分析）
+deterministic: true
+
+# EMA 权重 (仅 JetTrainer)
+# 可选值:
+#   true: 使用指数移动平均权重（需检查点含 ema 字段）
+#   false: 使用训练权重
+use_ema: false
+
+# 输出目录
+# 可选值:
+#   null: 自动在模型目录下创建 validation_YYYYMMDD_HHMMSS
+#   路径字符串: 指定输出目录
+output_dir: null
+
+# 计算设备
+# 可选值: 'auto' / 'cuda' / 'cpu'
+# 'auto' 自动选择 CUDA（如可用）
+device: auto
+
+# =============================================================================
+# =============================================================================
+#
+# 控制周期决定了射流施加的时序模式，必须与训练配置一致！
+#
+# 两种训练器的参数语义:
+#
+# ┌────────────────┬───────────────────┬────────────────────────────────────┐
+# │ Trainer        │ 参数名            │ 说明                               │
+# ├────────────────┼───────────────────┼────────────────────────────────────┤
+# │ JetTrainer     │ control_interval  │ 控制更新间隔 (env-steps)           │
+# │                │ action_duration   │ 射流施加持续步数                   │
+# │                │ smoothing_alpha   │ 时间平滑系数 (0~1)                 │
+# ├────────────────┼───────────────────┼────────────────────────────────────┤
+# │ DRLTrainer     │ control_interval  │ 1 DRL step 对应的 CFD 步数         │
+# │                │ smoothing_alpha   │ 时间平滑系数 (0~1)                 │
+# └────────────────┴───────────────────┴────────────────────────────────────┘
+# (DRLTrainer 中 action_duration 始终等于 control_interval)
+#
+# Validator 统一使用 control_interval + action_duration:
+#   - JetTrainer 模型: 直接使用
+#   - DRLTrainer 模型: 直接使用 env.control_interval
+#
+
+# 控制更新间隔 (env-steps)
+# 每隔 control_interval 步获取一次新的控制动作
+# JetTrainer: 对应 training.control_interval
+# DRLTrainer: 对应 env.control_interval
+control_interval: 2
+
+# 控制信号持续步数 (env-steps)
+# 每个控制周期内，前 action_duration 步施加射流
+# 施加条件: (step % control_interval) < action_duration
+# 通常 = control_interval (持续施加)
+# (仅 JetTrainer 有效，DRLTrainer 中 action_duration 始终等于 control_interval)
+action_duration: 2
+
+# Warmup 阶段是否施加射流
+# 可选值:
+#   true: 预热阶段施加射流（使用初始动作或 policy 输出）
+#   false: 预热阶段不施加射流（自然流动）
+warmup_apply_jets: true
+
+# Warmup 阶段是否更新控制
+# 可选值:
+#   true: 预热阶段调用 policy 生成控制信号
+#   false: 预热阶段使用固定控制（零或上次动作）
+warmup_update_controls: true
+
+# =============================================================================
+# 4. 输入特征配置 (可选，覆盖 trainer_config)
+# =============================================================================
+# 用于验证时修改输入特征（如测试不同特征组合）
+# 设为 null 时使用 trainer_config 中的配置
+#
+# input_features:
+#   main_input_type: probes        # null/target_probe/probes
+#   probe_fields: [u, v, p]        # 探针字段
+#   envstep_state: 2               # 历史堆叠步数
+#   include_target_velocity: false # 是否包含目标速度
+#   include_prev_amplitude_num: 1  # 历史幅值数量
+#   include_force_coeffs: false    # 是否包含力系数
+input_features: null
+
+# =============================================================================
+# 5. 可视化配置
+# =============================================================================
+visuals:
+  # 是否启用流场可视化
+  enabled: true
+  
+  # 帧保存间隔 (每 N 个 env-step 保存一帧)
+  interval: 10
+  
+  # 绘制的物理量列表
+  # 可选: velocity_magnitude, velocity_x, velocity_y, pressure, vorticity, streamlines
+  quantities:
+    - velocity_magnitude
+    - velocity_x
+    - velocity_y
+    - pressure
+    - vorticity
+    - streamlines
+  
+  # 是否保存初始帧和最终帧 (_final 后缀)
+  save_endpoints: true
+  
+  # 是否保存原始流场数据 (raw/fields.h5)
+  # 用于后续分析 (POD/DMD 等)
+  save_fields: true
+  
+  # 是否将图片合成 mp4 视频 (需要 ffmpeg)
+  generate_video: true
+  
+  # 视频帧率
+  video_fps: 15
+  
+  # 障碍物绘制风格
+  # 可选: none / outline / fill / both
+  obstacle_style: both
+  
+  # 平滑渲染
+  smooth: true

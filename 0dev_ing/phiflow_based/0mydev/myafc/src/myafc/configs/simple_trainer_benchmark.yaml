@@ -1,0 +1,441 @@
+# =============================================================================
+# SimpleTrainer 配置文件 (benchmark)
+# =============================================================================
+#
+# 这是 MLP 监督训练器的完整配置示例。
+# 使用 PhiFlow 原生可微分机制，支持端到端梯度反传。
+#
+# 使用方法:
+#   python train_open_loop.py --config path/to/this.yaml
+#   python train_closed_loop.py --config path/to/this.yaml
+#
+# =============================================================================
+
+# 基础求解场景配置文件路径 for solver & runner （必需）
+# 其中 runner 相关的配置参数将作用于训练结束时的验证阶段
+# 相对于当前配置文件的路径，或绝对路径
+base_config_path: "cfgs4env/karman_torch_drl_square.yaml"
+
+# =============================================================================
+# 多环境训练配置（可选）
+# =============================================================================
+# 并行环境数量
+# 1 = 单环境模式（默认，使用 KarmanTorchSolver）
+# >1 = 多实例模式（使用 ParallelSolverManager，每个环境独立 Solver 实例）
+num_envs: 1
+
+# 每个环境的配置变体（可选）
+# 用于覆盖 base_config_path 中的参数，实现异构环境训练
+# 列表长度应等于 num_envs，或为 null（所有环境使用相同配置）
+#
+# ═══════════════════════════════════════════════════════════════════════════
+# 可覆盖的参数（env_variants 支持的字段）
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# 多实例模式下，每个环境独立创建 Solver，因此可以覆盖 **任意** 配置参数，
+# 包括边界条件、障碍物几何等。
+#
+# ┌─────────────────────────────────────────────────────────────────────────┐
+# │ 边界条件（完全支持异构）                                                  │
+# ├─────────────────────────────────────────────────────────────────────────┤
+# │ solver.boundary.velocity.x-   入口边界配置                               │
+# │   - type: inflow/zero-gradient                                          │
+# │   - value: [Ux, Uy]  入口速度向量                                        │
+# └─────────────────────────────────────────────────────────────────────────┘
+#
+# ┌─────────────────────────────────────────────────────────────────────────┐
+# │ 物理参数（完全支持异构）                                                  │
+# ├─────────────────────────────────────────────────────────────────────────┤
+# │ solver.fluid.viscosity    运动学黏度 ν [m²/s]                            │
+# │ solver.fluid.density      流体密度 ρ [kg/m³]                             │
+# └─────────────────────────────────────────────────────────────────────────┘
+#
+# ┌─────────────────────────────────────────────────────────────────────────┐
+# │ 障碍物几何（完全支持异构）                                                │
+# ├─────────────────────────────────────────────────────────────────────────┤
+# │ solver.obstacle.center    障碍物中心位置                                 │
+# │ solver.obstacle.size      方柱尺寸                                      │
+# │ solver.obstacle.radius    圆柱半径                                      │
+# └─────────────────────────────────────────────────────────────────────────┘
+#
+# ┌─────────────────────────────────────────────────────────────────────────┐
+# │ 初始条件（完全支持异构）                                                  │
+# ├─────────────────────────────────────────────────────────────────────────┤
+# │ solver.initial.velocity   初始速度 (Ux, Uy) [m/s]                       │
+# │ solver.initial.from_h5    从 H5 文件加载初始场                           │
+# │ solver.initial.from_h5_step   加载 H5 的指定时间步                       │
+# └─────────────────────────────────────────────────────────────────────────┘
+#
+# 示例配置（不同入口流速 + 不同黏度）:
+# num_envs: 5
+# env_variants:
+#   - { solver: { fluid: { viscosity: 0.002 }, boundary: { velocity: { x-: { value: [1.0, 0.0] }}}}}
+#   - { solver: { fluid: { viscosity: 0.001 }, boundary: { velocity: { x-: { value: [2.0, 0.0] }}}}}
+#   - { solver: { fluid: { viscosity: 0.0005 }, boundary: { velocity: { x-: { value: [3.0, 0.0] }}}}}
+#   - { solver: { fluid: { viscosity: 0.00025 }, boundary: { velocity: { x-: { value: [4.0, 0.0] }}}}}
+#
+env_variants: null
+
+# =============================================================================
+# MLP 网络配置
+# =============================================================================
+mlp:
+  # 隐藏层维度列表，例如 [512, 512] 表示两个隐藏层
+  hidden_dims: [512, 512]
+  
+  # 输出幅值上限，MLP 输出后将缩放到 [-amplitude_max, amplitude_max]
+  amplitude_max: 1.5
+  
+  # 固定射流角度（度），90°=向上, 270°=向下
+  # 设置后 MLP 仅输出幅值，角度固定
+  # null 表示由网络学习
+  angle_deg_fixed: 90.0
+  
+  # 所有喷嘴是否共用同一组输出
+  # true: 网络输出 2 个值，所有喷嘴共用
+  # false: 网络输出 2*num_nozzles 个值
+  shared_output: true
+  
+  # 是否对输入特征进行归一化（使用 EMA 统计）
+  normalize_input: true
+  
+  # 动作缩放方式:
+  # - 'tanh': tanh(x) * scale (SAC 风格，严格边界，梯度饱和快)
+  # - 'clamp': clamp(x, low, high) (PPO 风格，硬裁剪)
+  # - 'softsign': x/(1+|x|) * scale (梯度衰减慢)
+  action_scale: 'softsign'
+  
+  # 相对动作模式：输出解释为增量，叠加到上一步动作
+  # false: 绝对动作模式（默认），网络直接输出目标幅值
+  # true: 相对动作模式，action = prev_action + tanh(network_output) * action_range
+  #       增量通过 tanh 约束到 [-action_range, action_range]，允许一步内完全改变动作
+  relative_action: false
+  
+  # 确定性策略模式：
+  # 是否使用确定性策略（不随机采样，直接取均值作为动作输出）
+  # false: 随机策略（默认），从高斯分布采样动作，用于探索和训练
+  # true: 确定性策略，直接使用策略网络输出的均值作为动作
+  # 注意：该设置在训练和验证阶段保持一致
+  deterministic_policy: false
+  
+  # Agent 模型初始化权重文件路径
+  # null: 不加载权重文件，随机初始化模型参数
+  # 字符串: 指定 .pt/.pth 文件路径，加载预训练权重用于 fine-tune 或继续训练
+  # 支持相对路径（相对于配置文件目录）和绝对路径
+  # 支持的文件格式:
+  #   - 完整模型: torch.save(model, path)
+  #   - 状态字典: torch.save(model.state_dict(), path)
+  #   - Checkpoint 字典: 包含 'state_dict' / 'model_state_dict' / 'policy_state_dict' 键
+  agent_model_path: null
+
+# =============================================================================
+# 输入特征配置
+# =============================================================================
+input_features:
+  # 探针输入类型（作为神经网络的主要输入特征）:
+  # - null / ~: 不使用任何探针数据作为输入（仅使用其他特征如目标速度、历史幅值等）
+  # - 'target_probe': 仅使用 loss.target_probe_position 定义的目标探针
+  # - 'probes': 使用 base_config_path 中的所有探针 + target_probe
+  main_input_type: 'target_probe'
+  
+  # 探针数据字段选择（可选 u/v/p 的任意组合）
+  # 仅当 main_input_type 不为 null / ~ 时生效
+  # 示例: ['u', 'v'] 只使用速度, ['p'] 只使用压力
+  probe_fields: ['u', 'v', 'p']
+  
+  # 是否包含目标速度 [u_target, v_target] 作为输入
+  include_target_velocity: true
+  
+  # 使用多少个历史环境步的 MLP 输出幅值作为输入特征
+  # 0 = 不使用历史幅值
+  # 1 = 使用上一步幅值
+  # n = 使用最近 n 步幅值（按时间顺序排列，最旧在前）
+  # 注意: 对于未施加射流控制的环境步，幅值默认取 0
+  include_prev_amplitude_num: 1
+  
+  # 是否包含力系数 [Cd, Cl] 作为输入
+  include_force_coeffs: true
+  
+  # 历史状态堆叠步数（别名: stack_envstep）
+  # 用于将多个历史环境步的探针数据堆叠作为输入特征，扩展时序观测范围
+  # 参考自 DRLinFluids 开源库中的 number_history_value 参数
+  #
+  # 取值说明:
+  #   1 = 仅使用当前步状态（默认，与 DRLinFluids 默认值一致）
+  #   n > 1 = 使用当前步 + 最近 n-1 个历史步的状态，共 n 步
+  #           历史不足时用零填充
+  #
+  # 影响输入维度:
+  #   当 envstep_state > 1 时，探针相关特征维度会乘以 envstep_state
+  #   例如: probe_dim=3, force_coeffs=2, envstep_state=3
+  #         → probe 特征维度 = (3 + 2) * 3 = 15
+  #         目标速度和历史幅值不受影响（不堆叠）
+  #
+  # 约束条件:
+  #   env_warmup_envsteps >= envstep_state - 1（warmup 步数必须足够填充历史缓冲区）
+  #   违反此约束时会抛出 ValueError
+  #
+  # 注意:
+  #   - 历史状态缓冲区在 solver.reset() 后手动清空，确保新仿真从干净状态开始
+  envstep_state: 1
+
+# =============================================================================
+# 损失函数配置
+# =============================================================================
+loss:
+  # 损失函数类型:
+  # - 'probe_mae': 探针速度 MAE
+  # - 'force_coeffs': 力系数 Cd^2 + Cl^2
+  loss_type: 'probe_mse'
+  
+  # 目标探针位置（相对坐标 [0~1]）
+  # 相对于 domain.size 的归一化位置
+  target_probe_position: [0.2616279069767442, 0.5236220472440945]  # right_top (top) of the square
+
+  # 目标速度 [u, v]，用于 probe_mse/probe_mae loss
+  # 结合 loss.target_probe_position，形成完整的目标定义
+  target_velocity: [0.0, 0.233]
+  
+  # 速度项权重
+  velocity_weight: 1.0
+  
+  # 力系数 loss 参数（仅 loss_type='force_coeffs' 时使用）
+  cd_target: 0.0    # Cd 目标值，0 表示最小化阻力
+  cl_target: 0.0    # Cl 目标值，0 表示稳定升力
+  cl_weight: 0.0    # Cl 项权重
+  
+  # ========== 正则化 (提高策略稳定性和训练稳定性) ==========
+  # 注意：正则化项仅在动作更新(神经网络 forward)步施加（每个 control_interval 的第一步）
+
+  # ===== 控制信号幅值 L2 正则化（惩罚大幅值控制）=====
+  # loss += amplitude_l2_weight * mean(amplitude^2)
+  amplitude_l2_weight: 0.0
+  
+  # ===== 时序平滑正则化（缓解 loss 大起大落）=====
+  # 惩罚相邻控制信号的剧烈变化：|a_t - a_{t-1}|^2
+  temporal_smoothness_weight: 1e-3
+  
+  # 动作变化率限制（软约束，仅惩罚超过限制的变化）
+  # 当 |a_t - a_{t-1}| > action_rate_limit 时施加惩罚
+  # null 或 0 表示不限制（使用标准 L2 平滑）
+  action_rate_limit: 0.8
+  
+  # ===== 策略稳定性正则化（防过冲）=====
+  # 惩罚当前输出与历史移动平均的偏差：|a_t - ā_EMA|^2
+  # 防止策略变化过快导致 loss 持续上升
+  policy_stability_weight: 1e-3
+  
+  # 移动平均动量系数 α ∈ (0, 1]
+  # ā_EMA = α * a_t + (1-α) * ā_EMA_prev
+  # 较小的值使 EMA 更平滑，对历史依赖更强
+  policy_stability_momentum: 0.1
+
+  # ===== 熵正则化（PPO 风格，使用高斯分布的熵）=====
+  # 使用策略的高斯分布的熵：H(π) = Σ 0.5*log(2πe*σ²)
+  # 熵越大，策略越具有探索性；熵越小，策略越确定性，避免策略过早收敛陷入局部最优
+  # loss -= entropy_weight * H(π)
+  entropy_weight: 1e-3
+  
+  # ===== KL 散度正则化（PPO 系列风格，稳定策略更新）=====
+  # 核心思想：限制新旧策略分布的差异，避免更新过大导致训练崩溃
+  #
+  # 实现细节：
+  # - 维护 policy_net_old 副本，保存**上一次更新前**的网络权重
+  # - 在动作更新步，缓存 state 副本，确保新旧策略使用相同 state
+  # - 用 policy_net_old 和缓存的 state 计算旧动作分布，与当前分布计算 KL 散度
+  # - 每次 optimizer.step() **前**，将当前网络权重同步到 policy_net_old
+  #
+  # KL(π_new || π_old) = Σ [log(σ_old/σ_new) + (σ_new² + (μ_new-μ_old)²)/(2σ_old²) - 0.5]
+  # loss += kl_weight * mean(KL)
+  #
+  # NOTE (重要！) 该算法属于同策略 (on-policy)，权重更新后立即影响后续采样（非 i.i.d.），故需要一些抑制神经网络更新幅度的正则化
+  kl_weight: 0.0
+  
+  # ===== 最后 N 个 epoch 禁用正则化 =====
+  # 在最后 N 个 epoch 禁用所有正则化项，让策略充分收敛 (0=不禁用, n=禁用最后n个, 'all'=全部禁用, n>=epochs 等效 'all')
+  disable_regularization_last_epochs: 1
+  
+# =============================================================================
+# 入口边界配置
+# =============================================================================
+inlet:
+  # 入口边界模式:
+  # - 'zero_gradient': 零梯度边界（常用于周期性/开放流动）
+  # - 'fixed': 固定速度入口
+  # - 'sinusoidal': 正弦变化速度入口
+  mode: 'zero_gradient'
+  
+  # fixed 模式: 入口速度 [Ux, Uy]
+  fixed_velocity: [1.0, 0.0]
+  
+  # sinusoidal 模式参数:
+  # v(t) = offset + amplitude * sin(2π * frequency * t + phase)
+  amplitude: 0.5      # 振幅
+  frequency: 0.1      # 频率 (Hz)
+  phase_deg: 0.0      # 初始相位（度）
+  offset: [1.0, 0.0]  # 偏移量 [Ux0, Uy0]
+
+# =============================================================================
+# 训练配置
+# =============================================================================
+training:
+  # --- 多轮训练 (Epoch / Mini-Episode) ---
+  # 训练轮数（别名: num_mini_episode_per_subenv）
+  # 每轮 epoch 执行一个完整的 mini episode 训练循环（预热 + 训练阶段）
+  #
+  # 轮与轮之间会进行全面 reset（除策略神经网络权重外）：
+  #   - 重置 solver 流场状态（恢复到初始流场）
+  #   - 清空 state history buffer（envstep_state 功能）
+  #   - 清空 amplitude history（控制幅值历史）
+  #   - 重置策略稳定性 EMA
+  #   - 分离计算图（梯度不跨 epoch 传播）
+  #
+  # 典型用法:
+  #   epoch: 1    → 单轮训练（默认，向后兼容）
+  #   epoch: 5    → 5 轮训练，策略网络在不同初始状态下累积学习
+  #
+  # 注意:
+  #   - 多轮训练时，所有训练历史数据跨 epoch 累积（便于分析）
+  #   - TensorBoard 记录使用全局 step（跨 epoch 连续）
+  #   - DRL 文献中有时称为 "number of episodes per environment"
+  epoch: 1
+
+  # 每个 mini episode 的交互次数（控制信号更新次数）
+  # 总环境步数 = env_warmup_envsteps + num_interaction_per_mini_episode * control_interval
+  # 例如: env_warmup=5, num_interaction=100, control_interval=5 → 总步数 = 5 + 100*5 = 505
+  num_interaction_per_mini_episode: 10
+  
+  # --- 时间步控制参数（Global 全局参数，训练和验证阶段共用）---
+  # 一个控制信号持续施加多少个环境步
+  # 例如: action_duration=3 表示每个控制信号持续 3 步
+  # 注意: 此参数同时影响训练和验证阶段
+  action_duration: 10
+  
+  # 多少个环境步更新一次控制信号（必须 >= action_duration）（Global 全局参数，训练和验证阶段共用）
+  # 可选值:
+  # - 整数: 例如 10 表示每 10 步更新一次 MLP 输出
+  control_interval: 'equal2action_duration'
+  
+  # 多少个 interaction（控制信号更新周期）后训练/更新一次神经网络权重
+  # 实际累积的环境步数 envstep_per_value = num_of_interaction_per_agent_update × control_interval
+  # 例如: num_of_interaction_per_agent_update=3, control_interval=10 → envstep_per_value=30
+  num_of_interaction_per_agent_update: 3
+  
+  # --- Loss 权重配置 ---
+  # 每步 loss 的权重，用于加权求和后 backward
+  # 可选值:
+  # - 'equal': 等权重（默认），每步权重相同（会自动对和归一化）
+  # - 'exponential': 指数衰减，γ^i，较早的步权重更大，随步数增加逐渐衰减
+  # - [w1, w2, ...]: 自定义权重列表，长度需等于 envstep_per_value
+  loss_weights: 'exponential'
+  
+  # 指数衰减因子（仅 loss_weights='exponential' 时生效）
+  # 范围 (0, 1]，越小衰减越快
+  # 例如: gamma=0.9, n=10 时，权重约为 [1.0, 0.9, 0.81, 0.729, 0.6561, 0.59049, 0.531441, 0.4782969, 0.43046721, 0.387420489]
+  loss_gamma: 0.99
+  
+  # --- 优化器配置 ---
+  # 初始学习率
+  learning_rate: 5.0e-5
+  
+  # 优化器类型: 'adam', 'adamw', 'sgd', 'rmsprop'
+  optimizer: 'adam'
+  
+  # 优化器动量（仅 sgd/rmsprop 有效）
+  # YOLOv8 默认 0.937
+  optimizer_momentum: 0.937
+  
+  # 权重衰减（L2 正则化）
+  # YOLOv8 默认 0.0005
+  optimizer_weight_decay: 0.0005
+  
+  # 梯度裁剪阈值，null 表示不裁剪
+  grad_clip: 1.0
+  
+  # --- 学习率调度器配置（YOLOv8 风格）---
+  # 最终学习率比例（相对于初始 lr）
+  # 训练结束时 lr = learning_rate * lr_final
+  # 范围 (0, 1]，YOLOv8 默认 0.01
+  lr_final: 0.01
+  
+  # 学习率调度策略:
+  # - 'constant': 恒定学习率（不衰减）
+  # - 'linear': 线性衰减
+  lr_schedule: 'cosine'
+  
+  # 学习率预热的更新次数
+  # 在前 warmup_updates 次参数更新中，lr 从 warmup_bias_lr * lr 线性增长到 lr
+  # 0 表示不使用预热
+  warmup_updates: 3
+  
+  # 预热阶段的初始学习率比例
+  # 范围 [0, 1]，实际初始 lr = warmup_bias_lr * learning_rate
+  # YOLOv8 默认 0.1
+  warmup_bias_lr: 0.1
+  
+  # 预热阶段的动量初始值（仅 SGD 优化器有效）
+  # 动量从 warmup_momentum 线性增长到 optimizer_momentum
+  # YOLOv8 默认 0.8
+  warmup_momentum: 0.8
+  
+  # --- 重要性采样配置（PPO 风格）---
+  # 是否在 reward 上启用 PPO 式重要性采样
+  # 启用后，reward 会根据新旧策略的概率比进行加权：
+  # weighted_reward = clip(ratio, 1-clip_range, 1+clip_range) * reward
+  # 其中 ratio = π_new(a|s) / π_old(a|s)
+  use_importance_sampling: false
+  
+  # 重要性采样比率裁剪范围
+  # PPO 默认 0.2，即 ratio 被裁剪到 [0.8, 1.2]
+  # 较小的值使策略更新更保守
+  importance_sampling_clip_range: 0.2
+  
+  # --- Epoch 级别检查点保存 ---
+  # 每隔多少个 epoch 保存一次检查点
+  # 0 = 不按 epoch 保存（仅按环境步 checkpoint_interval 和最终保存）
+  # 1 = 每个 epoch 结束后都保存
+  # n = 每 n 个 epoch 保存一次（如 epoch=10, checkpoint_epoch_interval=5 时，在 epoch 5 和 10 各保存一次）
+  checkpoint_epoch_interval: 0
+  
+  # 随机种子，null 表示不固定
+  random_seed: 42
+  
+  # --- 预热阶段参数（Global 全局参数，训练和验证阶段共用）---
+  # 环境预热的环境步数（只执行仿真，不更新神经网络权重）
+  env_warmup_envsteps: 0
+  
+  # 预热阶段是否更新控制信号（调用 policy 生成新控制）
+  # 默认 false 表示预热阶段不更新控制（施加零/初始控制）
+  warmup_update_controls: false
+  
+  # 预热阶段是否施加射流
+  # 默认 false 表示预热阶段不施加任何射流
+  warmup_apply_jets: false
+  
+  # --- [Global 全局参数] 覆盖 solver 环境配置 ---
+  # 射流控制信号时间平滑系数，用于覆盖 base_config_path 中的 jets.smoothing_alpha
+  # null: 使用 solver 配置中的值（默认）
+  # 0~1: 覆盖 solver 配置，0=完全继承上帧, 1=无平滑
+  # 公式: A_smooth = (1 - α) * A_prev + α * A_curr
+  smoothing_alpha: 1.0
+  
+  # 训练后验证步数
+  validation_steps: 50
+  
+  # 日志详细程度: 'DEBUG', 'INFO', 'WARNING', 'ERROR'
+  # 注意: Trainer 的 verbose 会覆盖 Runner 和 Solver 的 verbose 配置，
+  # 确保日志级别由上层组件（Trainer）统一控制
+  verbose: 'INFO'
+
+# =============================================================================
+# 输出配置
+# =============================================================================
+output:
+  # 项目根目录
+  project: 'runs/train'
+  
+  # 实验名称前缀，自动添加编号如 exp, exp2, exp3
+  name: 'exp'
+  
+  # 检查点保存间隔（环境步）
+  checkpoint_interval: 300

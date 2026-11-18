@@ -1,0 +1,617 @@
+# =============================================================================
+# JetTrainer 完整配置文件 for 柱体绕流案例
+# =============================================================================
+#
+# 基于可微分模拟的 AFC 射流主动流动控制训练器配置
+# 核心参数参考 DRLinFluids 开源库的方柱绕流案例
+#
+# DRLinFluids 部分参考值:
+#   - 入口速度: [2.0, 0.0] m/s
+#   - dt: 5e-4 s
+#   - interaction_period: 0.013 s (26 × dt)
+#   - 控制幅值范围: [-4, 4]
+#   - 无控制 Cd 基线: ~1.549
+#   - 奖励: 1.549 - Cd - 0.1 × |Cl|
+#
+# 使用方法:
+#   from myafc.afc_supervision import JetTrainer
+#   trainer = JetTrainer("path/to/jet_trainer_main.yaml")
+#   results = trainer.train()
+#
+# =============================================================================
+
+# 环境配置文件路径 (相对于 myafc/configs 目录)
+env_config_path: null
+
+# =============================================================================
+# 训练参数
+# =============================================================================
+training:
+  # ========== 训练循环 ==========
+
+  # 训练轮数 (mini-episode 数量)
+  # 每轮执行一个完整的 mini episode 训练循环（预热 + 训练阶段）
+  # 轮与轮之间会进行全面 reset（除策略神经网络权重外）
+  epochs: 8
+
+  # [Global 全局参数] 预热环境步数
+  # 只执行仿真，不更新神经网络权重，用于冷启动和填充历史
+  # 注意: 应 >= envstep_state - 1，确保历史缓冲区填充完毕
+  env_warmup_envsteps: 7
+
+  # 预热阶段是否更新控制信号
+  # false = 预热阶段不调用 policy 生成新控制
+  warmup_update_controls: false
+
+  # 预热阶段是否施加射流
+  # false = 预热阶段不施加任何射流（自然流动发展）
+  warmup_apply_jets: false
+
+  # [Global 全局参数] 控制信号持续步数 (射流施加单次持续时长)
+  # 每个 control_interval 中，前 action_duration 步施加射流
+  # 值越小控制越精细
+  # DRLinFluids 参考: 圆柱=50步(0.025s), 方柱=26步(0.013s), 均基于 dt=5e-4
+  action_duration: 2
+
+  # [Global 全局参数] 控制更新间隔 (一个 interaction 的长度)
+  # 支持的值:
+  #   - 整数: 具体步数 (必须 >= action_duration)
+  control_interval: action_duration
+
+  # 每次 backward 累积的 interaction 数
+  # 实际累积环境步数 = num_of_interaction_per_agent_update × control_interval
+  # 如: 5，表示每次权重更新包含 5 个控制周期
+  num_of_interaction_per_agent_update: 250
+
+  # 每个 epoch 的 interaction 数
+  # 总环境步数/epoch = env_warmup_envsteps + num_interaction × control_interval
+  num_interaction_per_mini_episode: 250
+
+  # 长时序反传显存优化（保持训练语义不变）
+  # true: 使用 PyTorch autograd.save_on_cpu，将反传中间张量暂存到 CPU，backward 时回传到 GPU
+  #      不会像 TBPTT 那样截断跨时间步梯度链路
+  # false: 关闭
+  autograd_offload_to_cpu: true
+
+  # autograd_offload_to_cpu=true 时是否启用 pinned memory
+  # false: 兼容性更稳
+  autograd_offload_pin_memory: true
+
+  # ========== 多环境并行 ==========
+
+  # 并行环境数量
+  # 1 = 单环境模式（默认，使用 KarmanTorchSolver）
+  # >1 = 多实例模式（使用 ParallelSolverManager，每个环境独立 Solver 实例）
+  num_envs: 1
+
+  # 各环境的配置变体列表 (覆盖任意 solver 参数)
+  # 列表长度应等于 num_envs，或为 null（所有环境使用相同配置）
+  # 可覆盖: 边界条件、物理参数、障碍物几何、初始条件等
+  #
+  # 示例配置（不同入口流速 + 不同黏度）:
+  # num_envs: 3
+  # env_variants:
+  #   - { solver: { fluid: { viscosity: 0.002 }, boundary: { velocity: { x-: { value: [1.0, 0.0] }}}}}
+  #   - { solver: { fluid: { viscosity: 0.001 }, boundary: { velocity: { x-: { value: [2.0, 0.0] }}}}}
+  env_variants: null
+
+  # ========== 随机初始帧 (训练多样性增强) ==========
+
+  # 覆盖 env_config 中的 solver.initial.resume_step
+  # 每个 epoch 开始时从指定范围内随机选择帧索引初始化流场
+  # 取值:
+  #   null: 使用 env_config 中的固定配置（默认）
+  #   int: 固定帧索引
+  #   [min, max]: 每个 epoch 从该范围内随机选择
+  #               - 支持负索引（从末尾倒数），如 [-2000, -1] 表示从最后 2000 个时间步中随机选择
+  #               - 支持混合/逆序端点，例: [100, -100]（内部自动归一化）
+  # 注意: 需要 env_config 中配置有效的 resume_from h5 文件路径
+  solver_initial_resume_step: null
+
+  # 多环境是否同步使用相同的初始帧
+  # true: 所有环境使用同一随机帧（epoch 间不同，env 间相同）
+  # false: 每个环境独立随机选择帧（epoch 和 env 间均不同）
+  sync_resume_step_across_envs: true
+
+  # ========== 重要性采样 (PPO 风格) ==========
+
+  # 是否启用重要性采样
+  # 启用后，reward 根据新旧策略概率比加权：
+  # weighted_reward = clip(ratio, 1-clip_range, 1+clip_range) * reward
+  use_importance_sampling: false
+
+  # PPO 裁剪范围 (0.1-0.3 常用)
+  # 较小值使策略更新更保守
+  importance_sampling_clip_range: 0.2
+
+  # ========== [Global 全局参数] 覆盖 solver 环境配置 ==========
+
+  # 射流控制信号时间平滑系数
+  # 用于覆盖 env_config_path 中的 jets.smoothing_alpha
+  # 同时作用于训练和验证阶段
+  # 公式: A_smooth = (1 - α) * A_prev + α * A_curr
+  # 取值:
+  #   null: 使用 solver 配置中的值（默认）
+  #   0: 完全继承上帧（最平滑）
+  #   1: 无平滑（最快响应）
+  smoothing_alpha: 0.4
+
+  # ========== 噪声增强 (数据增强) ==========
+
+  # 是否对初始化速度场施加噪声（训练阶段）
+  # 启用后，每次环境 reset 后向速度场添加高斯噪声: v = v + N(0, noise_std * U_ref)
+  # 用于增强训练泛化能力，使策略对初始条件扰动更鲁棒
+  noise_envs: false
+
+  # 是否对观测施加噪声
+  # 启用后，探针采样速度 = 真实值 + N(0, noise_std)
+  noise_observation: false
+
+  # 噪声标准差 (相对于参考速度)
+  noise_std: 0.01
+
+  # 是否在验证阶段也施加噪声增强
+  # 启用后，验证阶段会施加与训练相同的噪声（noise_envs 配置）
+  # 用于评估策略对噪声的鲁棒性
+  # 默认关闭，确保验证结果的可复现性
+  validation_noise_enabled: false
+
+  # ========== 优化器 ==========
+
+  # 优化器类型 (YOLOv8 风格)
+  # 可选:
+  #   'adam': 标准 Adam
+  #   'nadam': NAdam (Nesterov-accelerated Adam)
+  #   'radam': RAdam (Rectified Adam)
+  #   'rmsprop': RMSprop
+  #   'auto': 自动选择 (默认 AdamW)
+  # 使用 YOLOv8 风格参数分组: bias(无衰减)/norm(无衰减)/weights(有衰减)
+  optimizer: adamw
+
+  # 优化器动量
+  optimizer_momentum: 0.937
+
+  # 初始学习率
+  learning_rate: 1e-3
+
+  # 最终学习率比例 (相对于初始 lr)
+  # 训练结束时 lr = learning_rate * lr_final
+  # 范围 (0, 1]，YOLOv8 默认 0.01
+  lr_final: 0.01
+
+  # 学习率调度策略
+  # 可选:
+  #   'constant': 恒定学习率（不衰减）
+  #   'linear': 线性衰减
+  lr_schedule: cosine
+
+  # 学习率预热的更新次数
+  # 在前 warmup_updates 次参数更新中，lr 从 warmup_bias_lr * lr 线性增长到 lr
+  # 0 表示不使用预热
+  warmup_updates: 2
+
+  # 预热阶段的初始学习率比例
+  # 范围 [0, 1]，实际初始 lr = warmup_bias_lr * learning_rate
+  warmup_bias_lr: 0.1
+
+  # 预热阶段动量初始值 (仅 SGD 优化器有效)
+  # 优化器动量从 warmup_momentum 线性增长到 optimizer_momentum
+  # YOLOv8 默认 0.8
+  warmup_momentum: 0.8
+
+  # 权重衰减（L2 正则化）
+  # YOLOv8 默认 0.0005
+  weight_decay: 0.0005
+
+  # 梯度裁剪阈值
+  # 0 = 不裁剪
+  grad_clip: 1.0
+
+  # ========== EMA / AMP ==========
+
+  # 是否使用 EMA 模型平均
+  # 启用后维护一个指数移动平均版本的网络权重
+  use_ema: false
+
+  # EMA 衰减率
+  # 较大值使 EMA 更平滑
+  ema_decay: 0.9999
+
+  # 是否使用混合精度训练
+  # 需要 CUDA 支持
+  # 注意: CFD 模拟中 AMP 可能导致压力求解数值问题，默认禁用
+  use_amp: false
+
+  # ========== 验证与检查点 ==========
+
+  # (训练完成后自动启动) 正式验证的环境步数 (不含 warmup)
+  # 总验证步数 = env_warmup_envsteps + validation_steps
+  # 0 = 跳过验证
+  #
+  #   - 涡脱周期 T ≈ 0.19s，每周期约 38 步
+  #   - 快速验证: ~120 步 (**3 个周期**)
+  #   - 标准验证: ~250 步 (**6 个周期**)
+  #   - 对齐验证: ~n 步   (m 个周期，与训练 epoch 对齐)
+  validation_steps: 500
+
+  # 检查点保存间隔 (epochs)
+  # 0 = 仅保存最终检查点
+  checkpoint_epoch_interval: 5
+
+  # ========== 检查点与断点续训 ==========
+
+  # checkpoint: 检查点路径
+  # null / 空: 不加载任何检查点
+  # 具体路径: 使用指定的 checkpoint 文件（支持相对/绝对路径）
+  # 示例: "runs/afc_train/exp/checkpoints/last.pt"
+  checkpoint: null
+
+  # resume: 控制 checkpoint 的加载方式
+  # true: 断点续训 - 恢复完整训练状态（epoch/optimizer/ema/scaler），复用原目录
+  # false: 仅初始化 - 仅加载模型权重，新建目录，训练状态从头开始
+  resume: false
+
+  # ========== 其他 ==========
+
+  # 随机种子
+  # null = 不固定
+  random_seed: 42
+
+  # 日志级别
+  # 可选: 'DEBUG' / 'INFO' / 'WARNING' / 'ERROR'
+  # 注意: Trainer 的 verbose 会覆盖 Solver 的配置
+  verbose: INFO
+
+# =============================================================================
+# Loss 配置
+# =============================================================================
+loss:
+  # ===================================================================
+  # ================ 主 Loss 权重 (>0 启用该 loss 类型) ================
+  # 可同时启用多个 loss，按权重加权求和
+
+  # ========== 探针 Loss 与 力系数 Loss ==========
+  # 探针速度 MSE loss 权重
+  # L = weight × mean((v_current - v_target)²)
+  probe_mse_weight: 0.0
+
+  # 探针速度 MAE loss 权重
+  # L = weight × mean(|v_current - v_target|)
+  # 对异常值更鲁棒
+  probe_mae_weight: 0.0
+
+  # 力系数 loss (force coefficient loss) 权重
+  # L = weight × [(Cd - cd_target)² + (Cl - cl_target)²]
+  # 用于阻力减小/升力抑制任务
+  force_weight: 0.0
+
+  # ---------- 目标值 ----------
+
+  # 相对于 domain.size 的归一化位置 (0~1)
+  # target_probe_position: [0.2616279069767442, 0.5236220472440945]  # 右上方射流喷口出口处 # 尾流：[0.53, 0.5]
+  target_probe_position: [0.117024, 0.617582] # 圆柱内圈 - 右侧上端
+  # target_probe_position: [0.112822, 0.640129] # 圆柱内圈 - 上侧右端
+
+  # 目标速度 [u, v]
+  # 用于 probe_mse / probe_mae loss
+  target_velocity: [0.0, 0.0]
+
+  # 阻力系数目标 (用于 force coefficient loss)
+  # 0 = 最小化阻力
+  cd_target: 0.0
+
+  # 升力系数目标 (用于 force coefficient loss)
+  # 0 = 稳定升力
+  cl_target: 0.0
+
+  # ========== 流场相关 loss (基于流场计算的 loss) 的区域设置 ==========
+  # 区域边界 [x_start, y_start, x_end, y_end] (相对坐标)
+  # 适用于所有基于流场计算的 loss（field_rms / field_fft / field_fluctuation / 所有的 模态 Loss）
+  # null = 使用下游默认区域
+  field_loss_region: null
+
+  # ========== 直接流场 Loss (field_rms / field_fft / field_fluctuation) ==========
+  # 基于指定区域流场的 loss，region 指定采样区域
+
+  # 流场 RMS loss 权重
+  # L = weight × sqrt(mean(field²))
+  # 直接最小化流场幅值
+  field_rms_weight: 0.0
+
+  # 流场 FFT 模态 loss 权重
+  # L = weight × weighted_sum(top_k_fft_magnitudes)
+  # 抑制流场中的周期性扰动
+  field_fft_weight: 0.0
+
+  # 流场波动稀疏 loss 权重
+  # L = weight × mean(top_k_fluctuations)
+  # 自动定位并抑制局部高波动区域
+  field_fluctuation_weight: 0.0
+
+  # ---------- 流场 Loss 高级配置 ----------
+
+  # 各场类型权重 (用于 multi_field_loss)
+  field_velocity_weight: 0.0
+  field_vorticity_weight: 0.0
+  field_pressure_weight: 0.0
+
+  # FFT loss 配置
+  field_fft_n_modes: 5       # 考虑的 FFT 模态数
+  field_fft_exclude_dc: true # 排除 DC 分量
+
+  # 波动稀疏配置
+  field_fluctuation_top_k: 100      # 选取 top-k 波动点
+  field_fluctuation_agg: 'mean'     # 聚合方式: mean/sum/max
+
+  # ========== 模态 Loss ==========
+  # 基于快照序列的模态分解 loss
+
+  # POD 模态 loss 权重
+  # L = weight × mean(non_dominant_singular_values)
+  # 抑制非稳态模态能量
+  modal_pod_weight: 0.0
+
+  # DMD 模态 loss 权重
+  # L = weight × mean(unstable_mode_amplitudes)
+  # 抑制不稳定模态（|λ| ≠ 1 的模态）
+  modal_dmd_weight: 1.0
+
+  # 稳态残差 loss 权重
+  # L = weight × sqrt(mean((field - steady_state)²))
+  # 鼓励流场趋近稳态
+  modal_residual_weight: 0.0
+
+  # ---------- 模态 Loss 高级配置 ----------
+
+  # 快照缓冲区大小 (用于 POD/DMD)
+  modal_snapshot_buffer_size: 20
+
+  # 保留的模态数量
+  modal_n_modes: 5
+
+  # 排除前 k 个主模态 (通常是稳态/平均场)
+  modal_exclude_first_k: 1
+
+  # ========== DRLinFluids 风格 Reward-based Loss ==========
+  # 参考: DRLinFluids 论文中的奖励函数设计
+  # reward = cd_baseline - Cd - alpha_lift × |Cl|
+  # 其中 cd_baseline 为无控制时的参考阻力系数
+  # loss = -reward (最大化 reward = 最小化 loss)
+
+  # DRL reward loss 权重 (>0 启用)
+  force_drl_weight: 0.0
+
+  # 无控制基线 Cd（典型方柱 Re=100: ~1.549; 圆柱 Re=100: ~3.205 (from DRLinFluids)）
+  cd_baseline: 0
+
+  # 升力惩罚系数
+  alpha_lift: 0.1  # DRLinFluids-square: 0.1
+
+  # DRL loss 时间平均窗口 (类似 DRLinFluids 论文中的处理)
+  # 可选:
+  #   null 或 1: 不进行时间平均，使用瞬时值 (默认)
+  #   正整数 N: 对最近 N 个 env-step 的 Cd/Cl 进行滑动平均
+  #   'action_duration': 自动设为 action_duration 的值
+  #   'control_interval': 自动设为 control_interval 的值
+  force_drl_avg_window: action_duration
+
+  # 是否对 Cl 取绝对值后再进行时间平均
+  # true: 平均 |Cl| (即 mean(|Cl_t|))，适合抑制升力振荡
+  # false: 平均 Cl (即 mean(Cl_t))，正负可能抵消趋近零 (默认)
+  force_drl_cl_abs: true
+
+  # ========== 涡脱抑制 Loss ==========
+
+  # 涡脱抑制 loss 权重
+  # 基于 Cl 历史的 FFT 分析，抑制涡脱频率成分
+  force_vortex_weight: 0.0
+
+  # Cl 历史长度 (用于 FFT 分析)
+  vortex_cl_history_len: 50
+
+  # ===================================================================
+  # ========== 时间维度权重 (Loss 累积) ==========
+
+  # 每步 loss 的权重方案
+  # 可选:
+  #   'equal': 等权重（每步权重相同，自动归一化）
+  #   'exponential': 指数衰减 γ^i（较早的步权重更大）
+  loss_weights: exponential
+
+  # 指数衰减因子 (仅 exponential 模式)
+  # 范围 (0, 1]，越小衰减越快
+  loss_gamma: 0.99
+
+  # ===================================================================
+  # ========== 正则化 ==========
+  # 注意：正则化项仅在动作更新步施加（每个 control_interval 的第一步）
+
+  # 幅值 L2 正则化 (惩罚大幅值控制)
+  # L += weight × mean(amplitude²)
+  amplitude_l2_weight: 1e-3
+
+  # 时序平滑正则化 (缓解控制信号大起大落)
+  # L += weight × mean((a_t - a_{t-1})²)
+  temporal_smoothness_weight: 0.01
+
+  # 动作变化率软约束阈值
+  # 当 |a_t - a_{t-1}| > action_rate_limit 时才惩罚
+  # null 或 0 = 使用标准 L2 平滑
+  action_rate_limit: 0.8
+
+  # 策略稳定性正则化 (EMA 偏离惩罚)
+  # L += weight × mean((a_t - ā_EMA)²)
+  # 防止策略变化过快导致 loss 持续上升
+  policy_stability_weight: 1e-3
+
+  # 策略稳定性 EMA 动量 α ∈ (0, 1]
+  # ā_EMA = α * ā_EMA_prev + (1-α) * a_t
+  # 较大值使 EMA 更平滑
+  policy_stability_momentum: 0.95
+
+  # 熵正则化 (PPO 风格，鼓励探索)
+  # 使用策略高斯分布的熵: H(π) = Σ 0.5×log(2πe×σ²)
+  # L -= weight × H(π) (即惩罚低熵/确定性策略)
+  entropy_weight: 0.01
+
+  # KL 散度正则化 (PPO 风格，稳定策略更新)
+  # 限制新旧策略分布差异，避免更新过大
+  # KL(π_new || π_old) = Σ [log(σ_old/σ_new) + (σ_new² + (μ_new-μ_old)²)/(2σ_old²) - 0.5]
+  # L += weight × mean(KL)
+  kl_weight: 0.001
+
+  # ===== 最后 N 个 epoch 禁用正则化 =====
+  # 在最后 N 个 epoch 禁用所有正则化项，让策略充分收敛
+  # 取值: 0 = 不禁用，n = 最后 n 个 epoch 禁用，'all' = 所有 epoch 禁用
+  # 当 n >= epochs 时等效于 'all'
+  disable_regularization_last_epochs: all
+
+# =============================================================================
+# [Global 全局参数] Agent 配置 (神经网络策略)
+# =============================================================================
+agent:
+  # 隐藏层维度列表
+  # 例如 [512, 512] 表示两个 512 神经元的隐藏层
+  hidden_dims: [126, 126]
+
+  # 最大控制幅值
+  # MLP 输出后缩放到 [-amplitude_max, amplitude_max]
+  # 圆柱案例 saturation=1.5，故 amplitude_max 应 <= 1.5
+  amplitude_max: 4.0
+
+  # 固定射流角度（度）
+  # 90° = 向上, 270° = 向下
+  # 设置后 MLP 仅输出幅值，角度固定
+  # null = 由网络学习
+  angle_deg_fixed: 90.0
+
+  # 所有喷嘴是否共用同一组输出
+  # true: 网络输出 1 个幅值，所有喷嘴共用
+  # false: 网络输出 num_nozzles 个值
+  shared_output: true
+
+  # 是否对输入特征进行归一化（使用 EMA 统计）
+  normalize_input: true
+
+  # 动作缩放方式
+  # 可选:
+  #   'tanh': tanh(x) * scale (SAC 风格，严格边界，梯度饱和快)
+  #   'clamp': clamp(x, low, high) (PPO 风格，硬裁剪)
+  action_scale: tanh
+
+  # 相对动作模式
+  # false: 绝对动作模式（默认），网络直接输出目标幅值
+  # true: 相对动作模式，action = prev_action + network_output * action_range
+  #       适合需要平滑控制的场景
+  relative_action: false
+
+  # 确定性策略模式
+  # false: 随机策略（默认），从高斯分布采样动作，用于探索和训练
+  # true: 确定性策略，直接使用策略网络输出的均值作为动作
+  deterministic: true
+
+
+# =============================================================================
+# 输入特征配置
+# =============================================================================
+input_features:
+  # 主输入类型 (作为神经网络的主要输入特征)
+  # 可选:
+  #   null / ~: 不使用任何探针数据作为输入
+  #   'target_probe': 仅使用 loss.target_probe_position 定义的目标探针
+  #   'probes': 使用 env_config_path 中的所有探针 + target_probe
+  main_input_type: target_probe
+
+  # 探针数据字段选择
+  # 可选 u/v/p 的任意组合
+  # 仅当 main_input_type 不为 null 时生效
+  probe_fields: [p,]
+
+  # 是否包含力系数 [Cd, Cl] 作为输入
+  include_force_coeffs: false
+
+  # 历史状态堆叠步数 (别名: stack_envstep)
+  # 用于将多个历史环境步的 探针数据 和/或 力系数数据 堆叠作为输入特征
+  # 取值:
+  #   1 = 仅使用当前步状态（默认）
+  #   n > 1 = 使用当前步 + 最近 n-1 个历史步，共 n 步
+  # 影响输入维度: 探针 和/或 力系数 特征维度会乘以 envstep_state
+  # 约束: env_warmup_envsteps >= envstep_state - 1
+  envstep_state: 2
+
+  # 是否包含目标速度 [u_target, v_target] 作为输入
+  include_target_velocity: false
+
+  # 历史幅值数量 (作为输入特征)
+  # 0 = 不使用历史幅值
+  # n = 使用最近 n 步幅值（按时间顺序排列，最旧在前）
+  include_prev_amplitude_num: 1
+
+# =============================================================================
+# 入口边界配置
+# =============================================================================
+inlet:
+  # 入口边界模式
+  # 可选:
+  #   null / ~: 不覆盖，直接使用 env_config_path 中的边界配置 (默认)
+  #   'fixed': 固定速度入口
+  #   'zero_gradient': 零梯度边界（常用于周期性/开放流动）
+  #   'sinusoidal': 正弦变化速度入口
+  mode: ~
+
+  # ------ fixed 模式: 入口速度 [Ux, Uy] ------
+  # DRLinFluids 参考值: [2.0, 0.0] m/s
+  fixed_velocity: [2.0, 0.0]
+
+  # ------ sinusoidal 模式参数 ------
+  # v(t) = offset + amplitude × sin(2π × frequency × t + phase)
+
+  # 振幅
+  amplitude: 0.05
+
+  # 频率 (Hz)
+  frequency: 0.2
+
+  # 初始相位（度）
+  phase_deg: 0.0
+
+  # 偏移量 [Ux0, Uy0]
+  offset: [2.0, 0.0]
+
+# =============================================================================
+# 输出配置
+# =============================================================================
+output:
+  # 项目根目录
+  project: runs/afc_jet_train
+
+  # 实验名称前缀
+  # 自动添加编号: exp → exp2 → exp3 ...
+  name: cylinder
+
+  # 可视化配置
+  scatter_enabled: false   # 是否绘制散点标记（强调神经网络更新点）
+  scatter_size: 20.0       # 散点尺寸
+  vline_enabled: true      # 是否绘制竖直虚线（标记神经网络更新位置）
+  vline_width: 0.5         # 竖直虚线线宽
+
+# =============================================================================
+# 训练阶段流场可视化 (可选)
+# =============================================================================
+# 训练过程中实时保存流场图片和原始数据，用于监控和分析
+# 输出目录结构: exp_dir/{folder}/
+#   ├── raw/      # 原始流场数据 (fields.h5)
+#   └── frames/   # 可视化图片
+training_visuals:
+  enabled: true                     # 是否启用 (默认禁用，避免 IO 开销)
+  interval: 10                      # 每隔多少 env-step 保存一帧
+  quantities:                       # 绘制的物理量列表
+    - velocity_magnitude            # 速度幅值
+    # - pressure                    # 压力场
+    # - vorticity                   # 涡量（可选）
+  save_endpoints: true              # 是否保存初始帧(step=0)和最终帧(_final)
+  folder: training_fields           # 输出子目录名 (raw + frames)
+  smooth: true                      # 是否平滑插值热力图
+  video_fps: 10                     # 合成视频帧率
+  generate_video: true              # 是否生成视频 (false = 仅保存图片)
+  obstacle_style: fill              # 障碍物显示风格: outline/fill/both/none

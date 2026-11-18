@@ -1,0 +1,607 @@
+# =============================================================================
+# Kármán 方柱绕流配置 (PhiFlow Torch)
+# =============================================================================
+
+meta:
+  description: |
+    Kármán 方柱绕流仿真配置文件，基于 PhiFlow Torch 实现。
+    包含射流控制（Active Flow Control）选项，可用于强化学习环境。 
+  notes: "此为一个 benchmark ，此配置文件适用于 DRL 环境，障碍物形状为方柱，核心仿真配置与 DRLinFluids 论文（的源码）一致。"
+
+solver:
+  # --- 求解域 ---
+  domain:
+    size: [2.032, 1.016]
+    resolution: [258, 127]
+
+  # --- 障碍物 ---
+  obstacle:
+    enabled: true
+    shape: box                 # sphere(圆柱) / box(方柱)
+    center: [0.25, 0.5]        # 相对坐标 [0~1]，基于 domain.size
+    # radius: 10.0               # 绝对尺寸，shape=sphere 时生效
+    size: [0.0508, 0.0508]     # 绝对尺寸 [宽,高]，shape=box 时生效
+    rotation: 0.0              # 旋转角度（弧度）
+
+  # --- 流体物性 ---
+  fluid:
+    density: 1.0               # 密度 ρ (kg/m³ 或无量纲)
+    viscosity: 0.001           # 动力黏度 μ (Pa·s 或无量纲)，Re = ρUL/μ (Re=101.6)
+
+  # --- 初始条件 ---
+  # 注意: resume_from 若有效则完全覆盖 velocity，velocity 将被忽略
+  initial:
+    velocity: null             # 初始速度 [Ux, Uy]，null=自动从 inflow 获取
+    resume_from: null          # h5 文件路径，用于热启动/恢复仿真 (会覆盖 initial.velocity)
+    resume_step: -1            # 从 h5 加载的时间步，-1=最后一帧，>=0=指定帧
+    resume_strict: false       # 续算模式: false=热启动（新目录,步骤从0开始），true=严格续算（原目录,接续步骤）
+    # resume_from 设置为已有的场文件路径时，将从该文件加载流场数据以初始化仿真。
+    #   注意如果 resume_from 非 null 且文件存在，则 initial.velocity 将被忽略。
+    # resume_strict 模式说明:
+    #   false (默认): 热启动模式
+    #       - 仅使用场文件初始化流场（速度、压力）
+    #       - 输出保存到新目录，仿真时间从零开始
+    #       - 适合：基于已有流场开始新的独立仿真
+    #   true: 严格续算模式
+    #       - 接着场文件的指定时间步继续仿真
+    #       - 输出保持与场文件所属目录一致
+    #       - 删除指定时间步之后的所有数据并重新生成
+    #       - 仿真时间、图片编号等都接续
+    #       - 适合：仿真中断后继续运行
+
+  # --- 边界条件 ---
+  # 速度边界 type: inflow / dirichlet / wall / no-slip / zero-gradient / neumann / outflow / periodic
+  # 压力边界 type: dirichlet / zero-gradient / neumann
+  # 边界标识: x-(左) / x+(右) / y-(下) / y+(上)
+  boundary:
+    # 入口速度分布: uniform(均匀) / parabolic(抛物线)
+    #   uniform:   U(y) = value (常数)
+    #   parabolic: U(y) = 1.5*value * 4y(H-y)/H², 截面平均 = value
+    #   value 始终代表截面平均速度 U_mean (Re = U_mean*D/ν)
+    #   parabolic 模式下，运行时每步在 staggered tensor 入口面强制施加抛物线分布
+    #   DRLinFluids 圆柱案例使用抛物线入口 + no-slip 壁面
+    inlet_profile: uniform
+    velocity:
+      x-: { type: inflow, value: [2.0, 0.0] }  # 入口，value=[Ux, Uy]（parabolic时此值为截面平均速度）
+      x+: { type: zero-gradient }              # 出口
+      y-: { type: zero-gradient }                       
+      y+: { type: zero-gradient }
+    pressure:
+      x-: { type: zero-gradient }
+      x+: { type: dirichlet, value: 0.0 }      # 参考压力点
+      y-: { type: zero-gradient }
+      y+: { type: zero-gradient }
+
+  # --- 外力场 (可选) ---
+  forcing:
+    enabled: false
+    type: constant             # constant(定常) / kolmogorov(正弦)
+    # constant 参数:
+    force: [0.0, 0.0]          # 力向量 [Fx, Fy]
+    # kolmogorov 参数 (F_x = A*sin(k*y)):
+    amplitude: 1.0             # 振幅 A
+    wavenumber: 4              # 波数 k
+    noise_scale: 0.0           # 噪声幅度，0=无噪声
+
+  # --- 射流控制 (Active Flow Control) ---
+  # 在障碍物表面指定位置施加射流（吹/吸）边界条件
+  # 射流角度约定（物理绝对坐标系）: 0°=x+(→), 90°=y+(↑), 180°=x-(←), 270°=y-(↓)
+  # 处理流程：
+  #   1. Policy 输出原始控制信号 (amplitude, angle)
+  #   2. 饱和裁剪: |A| <= saturation
+  #   3. 缩放: A = A * amplitude_scale
+  #   4. 平滑: A = (1-α)*A_prev + α*A_curr
+  #   5. 空间分布: uniform / cosine
+  jets:
+    enabled: false
+    # 喷嘴配置列表，弧段 arc_deg 即定义喷嘴宽度
+    nozzles:
+      # - { arc_deg: [80, 100] }      # 顶部正中喷嘴，80°~100°弧段（宽度20°）
+      # - { arc_deg: [260, 280] }     # 底部正中喷嘴，260°~280°弧段
+      # - { arc_deg: [70.0, 110.0] }  # 顶部正中喷嘴，70°~110°弧段（宽度40°）
+      # - { arc_deg: [250.0, 290.0] } # 底部正中喷嘴，250°~290°弧段
+      # - { arc_deg: [89.0, 91.0] }   # 顶部正中喷嘴，89°~91°弧段（宽度2°）
+      # - { arc_deg: [269.0, 271.0] } # 底部正中喷嘴，269°~271°弧段
+      # - { arc_deg: [85, 95] }      # 顶部正中喷嘴，80°~100°弧段（宽度10°）（drl：圆柱 JET { nFaces: 17 }; 10° in paper）
+      # - { arc_deg: [265, 275] }     # 底部正中喷嘴，260°~280°弧段
+      # 角度区间对列表（deg），覆盖八个角落喷嘴（每个角对应一对贴边喷流）（drl：方柱 JET { nFaces: 1 }）
+      # - { arc_deg: [42.0, 45.0] }
+      - { arc_deg: [45.0, 48.0] }
+      # - { arc_deg: [132.0, 135.0] }
+      # - { arc_deg: [135.0, 138.0] }
+      # - { arc_deg: [222.0, 225.0] }
+      # - { arc_deg: [225.0, 228.0] }
+      - { arc_deg: [312.0, 315.0] }
+      # - { arc_deg: [315.0, 318.0] }
+    saturation: 4.0            # drl 方柱 4.0 # 饱和裁剪: |A| <= saturation
+    amplitude_scale: 1.0       # 缩放系数（平滑裁剪后乘以此值）
+    # 平滑公式: A_smooth = (1 - α) * A_prev + α * A_curr
+    #   α=0: 完全继承上帧（无响应）
+    #   α=1: 无平滑（完全跟随当前）
+    smoothing_alpha: 0.4
+    # 空间分布模式:
+    #   uniform: 均匀分布（每点流速相同）
+    #   cosine: 余弦分布，参考 Rabault 2019，峰值=A，公式: f(θ) = A * cos(π/ω * (θ - θ_center))
+    profile: uniform           # drl 方柱 uniform
+    # 控制策略配置
+    policy:
+      type: constant           # constant / sinusoidal / mlp / none
+      # --- constant 参数 ---
+      amplitude: 4.0           # 射流速度幅值
+      angle_deg: 90.0          # 射流角度（度，物理坐标），90°=向上
+      # --- sinusoidal 参数 ---
+      # amplitude(t) = amplitude * sin(2π * frequency * t + phase) + offset
+      # amplitude: 4.0         # 振幅 A
+      # frequency: 0.5         # 频率 f (Hz)
+      # phase_deg: 0.0         # 初始相位（度）
+      # angle_deg: 90.0        # 速度方向（度），0°=x+, 90°=y+
+      # offset: 0.0            # 幅值偏移量
+      # use_state_time: true   # 是否使用 state['time']
+      # angle_deg_fixed: null  # 固定角度（度），设置后覆盖 angle_deg
+      # --- mlp 参数 ---
+      # 输出后处理: amp=(tanh(x)+1)*0.5*amplitude_max, angle=atan2归一化
+      # input_type: probes     # probes / force_coeffs / both
+      # probe_names: null      # 使用的探针名称列表，null=全部
+      # hidden_dims: [64, 32]  # 隐藏层维度
+      # shared_output: true    # true=单输出控制所有喷嘴，false=每个喷嘴独立
+      # amplitude_max: 4.0     # 幅值上限，输出映射到 [-amplitude_max, amplitude_max]
+      # angle_range_deg: [0.0, 180.0]  # 角度范围（度）
+      # weights_path: null     # 预训练权重路径
+      # angle_deg_fixed: null  # 固定角度（度），设置后忽略网络输出的角度
+      # action_scale: clamp    # 动作缩放: tanh/clamp/softsign
+      # relative_action: false # 相对动作模式（输出为增量）
+      # deterministic_policy: false  # 确定性策略模式（不随机采样，直接取均值）
+
+  # --- 时间步进 ---
+  time:
+    dt: 5e-4                   # 时间步长，需满足 CFL 条件 dt < dx/U_max (finest grid: dt < 1e-3)
+    num_steps: 20000           # 默认总步数（可被 runner.run() 覆盖）
+    # 扩散求解方法: explicit / implicit / auto_substep
+    #   explicit    — diffuse.explicit()，条件稳定 (dt < dx²/(2ν))，速度最快
+    #   auto_substep — diffuse.explicit(substeps=N)，自动计算子步数保证稳定性
+    diffusion_method: auto_substep
+    # 对流方案: semi_lagrangian / mac_cormack
+    #   semi_lagrangian — 一阶精度，数值扩散较大（默认，速度快）
+    #   mac_cormack     — 二阶精度预测-校正，数值扩散小，涡脱落振幅更准确
+    #                     速度与 semi_lagrangian 相当，Cl_amp 可提升约 2 倍
+    advection_method: mac_cormack
+
+  # --- 运行时 ---
+  runtime:
+    differentiable: true
+    device: cuda               # cuda / cpu
+    random_seed: 42            # 随机种子，null=不固定
+    # 日志详细级别: 'DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL'
+    # 注意: 当通过 Runner 调用时，Runner 的 verbose 会覆盖此配置；
+    #       当通过 Trainer 调用时，Trainer 的 verbose 会覆盖此配置。
+    verbose: 'INFO'
+
+# =============================================================================
+# Runner 配置 (可选，用于 SolverRunner)
+# =============================================================================
+runner:
+  # 日志详细级别: 'DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL'
+  # 注意: 当通过 Trainer 调用 Runner 时，Trainer 的 verbose 会覆盖此配置。
+  verbose: 'INFO'
+  
+  # --- 输出目录 ---
+  output:
+    enabled: true
+    root: './outputs'          # 输出根目录
+    subdir: 'karman_run_drl_square'  # 子目录名
+
+  # --- 域概览图 ---
+  # 在仿真开始前绘制求解域概览图，包含: 域边界、障碍物、边界条件、射流喷嘴
+  domain_overview:
+    enabled: true
+    filename: 'domain_overview.png'  # 保存文件名（在 output 目录下）
+    show_grid: false
+    show_nozzles: true
+    show_nozzle_labels: false
+    nozzle_edge_only: true
+    show_probes: true
+    show_probes_labels: false
+    probe_size: 1.0            # 探针标记大小
+  
+  # --- 可视化 ---
+  visuals:
+    enabled: true
+    interval: 10               # 保存间隔
+    quantities:                # 可选: velocity_magnitude/velocity_x/velocity_y/pressure/vorticity/streamlines
+      - velocity_magnitude
+      - velocity_x
+      - velocity_y
+      - pressure
+      - vorticity
+      - streamlines
+    save_endpoints: true
+    folder: 'frames'           # 图片保存子目录（各quantity在其下创建子目录）
+    smooth: true
+    video_fps: 10              # 合成视频帧率
+    # 障碍物可视化
+    obstacle_style: 'both'     # 'outline'(仅轮廓) / 'fill'(填充NaN) / 'both'(轮廓+填充) / 'none'(不显示)
+    obstacle_fill_value: null  # 填充值，null=使用 NaN（透明效果），可设为数值如 0.0
+
+  # --- 场数据 ---
+  # 场数据保存到 H5 文件，支持多种场类型
+  fields:
+    save:                      # 保存到 h5 文件
+      enabled: true
+      interval: 10             # 每 N 步保存一次
+      filename: 'fields.h5'
+      quantities:              # 要保存的场类型（velocity/pressure 始终保存）
+        - velocity             # 速度场（StaggeredGrid，插值到中心网格后保存）
+        - pressure             # 压力场（CenteredGrid）
+        # - vorticity            # 涡量场（由 velocity 计算得到）
+        # - velocity_magnitude # 速度大小场（可选）
+        # - sdf                # Signed Distance Field（如果 solver 提供）
+        # - mask               # 障碍物掩码（如果 solver 提供）
+    cache:                     # 内存缓存（可通过 runner.fields 访问）
+      enabled: false
+      interval: 50
+
+  # --- 力系数 Cd/Cl ---
+  # Cd = Fx / (0.5*ρ*U²*A)，其中 A = L_ref × 1
+  # L_ref: 结构物在垂直于入流方向上的投影长度
+  #   - 圆柱: 直径 D = 2*radius（与来流角度无关）
+  #   - 方柱: 考虑旋转角度，计算矩形四顶点在垂直方向上的投影宽度
+  #           L_ref = max(proj) - min(proj)，其中 proj 为顶点在垂直方向的投影
+  force_coeffs:
+    enabled: true
+    interval: 1                # 记录间隔
+    filename: 'force_coeffs.csv'
+    reference_velocity: null   # 参考速度，null=自动从 inflow 获取
+    reference_length: null     # 参考长度（投影），null=自动计算（考虑旋转）
+    include_torque: false     # 是否计算并记录力矩 Mz
+
+  # --- 射流探针 ---
+  # 自动在每个喷嘴核心区域中心放置探针，记录射流的实际速度和压强
+  # 探针位置从 JetObstacle.get_nozzle_core_centers() 自动获取
+  jet_probes:
+    enabled: true
+    interval: 1                # 采样间隔
+    filename: 'jet_probes.csv' # 保存文件名（独立于常规探针）
+
+  # --- 探针采样 ---
+  probes:
+    enabled: true
+    interval: 1                # 采样间隔
+    filename: 'probes.csv'
+    locations:                 # 探针位置列表
+      # - { name: probe1, fraction: [0.5, 0.5] }   # 相对坐标 [0~1]
+      # - { name: probe2, units: [1.5,, 0.5] }    # 绝对坐标
+      # - name: upstream
+      #   fraction: [0.2, 0.5]
+      # - name: wake_center
+      #   fraction: [0.6, 0.5]
+      # - name: wake_upper
+      #   fraction: [0.65, 0.65]
+      
+      # - { name: right_top, fraction: [0.261628, 0.523622] }     # 结构物右上角(上)射流喷口
+      # - { name: right_bottom, fraction: [0.261628, 0.476378] }  # 结构物右下角(下)射流喷口
+      # - { name: left_top, fraction: [0.242248, 0.523622] }  # 结构物右下角(上)射流喷口
+      # - { name: left_bottom, fraction: [0.242248, 0.476378] }  # 结构物右下角(下)射流喷口
+      
+      # DRLinFluids probes (单位：米)
+      # base探针 1/5 - 方柱周围内圈 (square inner ring) (紧贴方柱边界的第一圈探针，距离=0.0121)，36 个点
+      # 上
+      - name: square_inner_ring_001
+        fraction: [0.235646, 0.536909]
+      - name: square_inner_ring_002
+        fraction: [0.239747, 0.536909]
+      - name: square_inner_ring_003
+        fraction: [0.243848, 0.536909]
+      - name: square_inner_ring_004
+        fraction: [0.247949, 0.536909]
+      - name: square_inner_ring_005
+        fraction: [0.252051, 0.536909]
+      - name: square_inner_ring_006
+        fraction: [0.256152, 0.536909]
+      - name: square_inner_ring_007
+        fraction: [0.260253, 0.536909]
+      - name: square_inner_ring_008
+        fraction: [0.264354, 0.536909]
+      - name: square_inner_ring_009
+        fraction: [0.268455, 0.536909]
+      # 下
+      - name: square_inner_ring_010
+        fraction: [0.231545, 0.463091]
+      - name: square_inner_ring_011
+        fraction: [0.235646, 0.463091]
+      - name: square_inner_ring_012
+        fraction: [0.239747, 0.463091]
+      - name: square_inner_ring_013
+        fraction: [0.243848, 0.463091]
+      - name: square_inner_ring_014
+        fraction: [0.247949, 0.463091]
+      - name: square_inner_ring_015
+        fraction: [0.252051, 0.463091]
+      - name: square_inner_ring_016
+        fraction: [0.256152, 0.463091]
+      - name: square_inner_ring_017
+        fraction: [0.260253, 0.463091]
+      - name: square_inner_ring_018
+        fraction: [0.264354, 0.463091]
+      - name: square_inner_ring_019
+        fraction: [0.268455, 0.463091]
+      # 左
+      - name: square_inner_ring_020
+        fraction: [0.231545, 0.536909]
+      - name: square_inner_ring_021
+        fraction: [0.231545, 0.528707]
+      - name: square_inner_ring_022
+        fraction: [0.231545, 0.520505]
+      - name: square_inner_ring_023
+        fraction: [0.231545, 0.512303]
+      - name: square_inner_ring_024
+        fraction: [0.231545, 0.504101]
+      - name: square_inner_ring_025
+        fraction: [0.231545, 0.495899]
+      - name: square_inner_ring_026
+        fraction: [0.231545, 0.487697]
+      - name: square_inner_ring_027
+        fraction: [0.231545, 0.479495]
+      - name: square_inner_ring_028
+        fraction: [0.231545, 0.471293]
+      # 右
+      - name: square_inner_ring_029
+        fraction: [0.268455, 0.528707]
+      - name: square_inner_ring_030
+        fraction: [0.268455, 0.520505]
+      - name: square_inner_ring_031
+        fraction: [0.268455, 0.512303]
+      - name: square_inner_ring_032
+        fraction: [0.268455, 0.504101]
+      - name: square_inner_ring_033
+        fraction: [0.268455, 0.495899]
+      - name: square_inner_ring_034
+        fraction: [0.268455, 0.487697]
+      - name: square_inner_ring_035
+        fraction: [0.268455, 0.479495]
+      - name: square_inner_ring_036
+        fraction: [0.268455, 0.471293]
+      #  base探针 2/5 - 方柱周围外圈 (square outer ring) (距离=0.0246)，36 个点
+      # 上
+      - name: square_outer_ring_001
+        fraction: [0.225394, 0.549213]
+      - name: square_outer_ring_002
+        fraction: [0.230862, 0.549213]
+      - name: square_outer_ring_003
+        fraction: [0.236330, 0.549213]
+      - name: square_outer_ring_004
+        fraction: [0.241798, 0.549213]
+      - name: square_outer_ring_005
+        fraction: [0.247266, 0.549213]
+      - name: square_outer_ring_006
+        fraction: [0.252734, 0.549213]
+      - name: square_outer_ring_007
+        fraction: [0.258202, 0.549213]
+      - name: square_outer_ring_008
+        fraction: [0.263670, 0.549213]
+      - name: square_outer_ring_009
+        fraction: [0.269138, 0.549213]
+      - name: square_outer_ring_010
+        fraction: [0.274606, 0.549213]
+      # 下
+      - name: square_outer_ring_011
+        fraction: [0.225394, 0.450787]
+      - name: square_outer_ring_012
+        fraction: [0.230862, 0.450787]
+      - name: square_outer_ring_013
+        fraction: [0.236330, 0.450787]
+      - name: square_outer_ring_014
+        fraction: [0.241798, 0.450787]
+      - name: square_outer_ring_015
+        fraction: [0.247266, 0.450787]
+      - name: square_outer_ring_016
+        fraction: [0.252734, 0.450787]
+      - name: square_outer_ring_017
+        fraction: [0.258202, 0.450787]
+      - name: square_outer_ring_018
+        fraction: [0.263670, 0.450787]
+      - name: square_outer_ring_019
+        fraction: [0.269138, 0.450787]
+      - name: square_outer_ring_020
+        fraction: [0.274606, 0.450787]
+      # 右
+      - name: square_outer_ring_021
+        fraction: [0.274606, 0.461724]
+      - name: square_outer_ring_022
+        fraction: [0.274606, 0.472660]
+      - name: square_outer_ring_023
+        fraction: [0.274606, 0.483596]
+      - name: square_outer_ring_024
+        fraction: [0.274606, 0.494532]
+      - name: square_outer_ring_025
+        fraction: [0.274606, 0.505468]
+      - name: square_outer_ring_026
+        fraction: [0.274606, 0.516404]
+      - name: square_outer_ring_027
+        fraction: [0.274606, 0.527340]
+      - name: square_outer_ring_028
+        fraction: [0.274606, 0.538276]
+      # 左
+      - name: square_outer_ring_029
+        fraction: [0.225394, 0.461724]
+      - name: square_outer_ring_030
+        fraction: [0.225394, 0.472660]
+      - name: square_outer_ring_031
+        fraction: [0.225394, 0.483596]
+      - name: square_outer_ring_032
+        fraction: [0.225394, 0.494532]
+      - name: square_outer_ring_033
+        fraction: [0.225394, 0.505468]
+      - name: square_outer_ring_034
+        fraction: [0.225394, 0.516404]
+      - name: square_outer_ring_035
+        fraction: [0.225394, 0.527340]
+      - name: square_outer_ring_036
+        fraction: [0.225394, 0.538276]
+      # base探针 3/5 - 结构物上部水平线 (structure top line)，6 个点
+      - name: structure_top_line_001
+        fraction: [0.243848, 0.573819]
+      - name: structure_top_line_002
+        fraction: [0.250000, 0.573819]
+      - name: structure_top_line_003
+        fraction: [0.256152, 0.573819]
+      - name: structure_top_line_004
+        fraction: [0.262303, 0.573819]
+      - name: structure_top_line_005
+        fraction: [0.268455, 0.573819]
+      - name: structure_top_line_006
+        fraction: [0.274606, 0.573819]
+      # base探针 4/5 - 结构物后部（下游 downstream）栅格，49 个点
+      # 行 y=0.583
+      - name: structure_rear_grid_001
+        fraction: [0.286909, 0.573819]
+      - name: structure_rear_grid_002
+        fraction: [0.299213, 0.573819]
+      - name: structure_rear_grid_003
+        fraction: [0.311516, 0.573819]
+      - name: structure_rear_grid_004
+        fraction: [0.323819, 0.573819]
+      - name: structure_rear_grid_005
+        fraction: [0.336122, 0.573819]
+      - name: structure_rear_grid_006
+        fraction: [0.348425, 0.573819]
+      - name: structure_rear_grid_007
+        fraction: [0.360728, 0.573819]
+      # 行 y=0.558 (也许不多余)
+      # - name: structure_rear_grid_001_
+      #   fraction: [0.243848, 0.549213]
+      # - name: structure_rear_grid_002_
+      #   fraction: [0.250000, 0.549213]
+      # - name: structure_rear_grid_003_
+      #   fraction: [0.256152, 0.549213]
+      # - name: structure_rear_grid_004_
+      #   fraction: [0.262303, 0.549213]
+      # - name: structure_rear_grid_005_
+      #   fraction: [0.268455, 0.549213]
+      # - name: structure_rear_grid_006_
+      #   fraction: [0.274606, 0.549213]
+      # 行 y=0.558
+      - name: structure_rear_grid_008
+        fraction: [0.286909, 0.549213]
+      - name: structure_rear_grid_009
+        fraction: [0.299213, 0.549213]
+      - name: structure_rear_grid_010
+        fraction: [0.311516, 0.549213]
+      - name: structure_rear_grid_011
+        fraction: [0.323819, 0.549213]
+      - name: structure_rear_grid_012
+        fraction: [0.336122, 0.549213]
+      - name: structure_rear_grid_013
+        fraction: [0.348425, 0.549213]
+      - name: structure_rear_grid_014
+        fraction: [0.360728, 0.549213]
+      # 行 y=0.533 (也许不多余)
+      # - name: structure_rear_grid_014_
+      #   fraction: [0.268455, 0.524606]
+      # - name: structure_rear_grid_015_
+      #   fraction: [0.274606, 0.524606]
+      # 行 y=0.533
+      - name: structure_rear_grid_015
+        fraction: [0.286909, 0.524606]
+      - name: structure_rear_grid_016
+        fraction: [0.299213, 0.524606]
+      - name: structure_rear_grid_017
+        fraction: [0.311516, 0.524606]
+      - name: structure_rear_grid_018
+        fraction: [0.323819, 0.524606]
+      - name: structure_rear_grid_019
+        fraction: [0.336122, 0.524606]
+      - name: structure_rear_grid_020
+        fraction: [0.348425, 0.524606]
+      - name: structure_rear_grid_021
+        fraction: [0.360728, 0.524606]
+      # 行 y=0.508
+      - name: structure_rear_grid_022
+        fraction: [0.286909, 0.500000]
+      - name: structure_rear_grid_023
+        fraction: [0.299213, 0.500000]
+      - name: structure_rear_grid_024
+        fraction: [0.311516, 0.500000]
+      - name: structure_rear_grid_025
+        fraction: [0.323819, 0.500000]
+      - name: structure_rear_grid_026
+        fraction: [0.336122, 0.500000]
+      - name: structure_rear_grid_027
+        fraction: [0.348425, 0.500000]
+      - name: structure_rear_grid_028
+        fraction: [0.360728, 0.500000]
+      # 行 y=0.483 (也许不多余)
+      # - name: square_outer_ring_141_
+      #   fraction: [0.268455, 0.475394]
+      # - name: square_outer_ring_142_
+      #   fraction: [0.274606, 0.475394]
+      # 行 y=0.483
+      - name: structure_rear_grid_029
+        fraction: [0.286909, 0.475394]
+      - name: structure_rear_grid_030
+        fraction: [0.299213, 0.475394]
+      - name: structure_rear_grid_031
+        fraction: [0.311516, 0.475394]
+      - name: structure_rear_grid_032
+        fraction: [0.323819, 0.475394]
+      - name: structure_rear_grid_033
+        fraction: [0.336122, 0.475394]
+      - name: structure_rear_grid_034
+        fraction: [0.348425, 0.475394]
+      - name: structure_rear_grid_035
+        fraction: [0.360728, 0.475394]
+      # 行 y=0.458 (也许不多余)
+      # - name: square_outer_ring_128_
+      #   fraction: [0.243848, 0.450787]
+      # - name: square_outer_ring_129_
+      #   fraction: [0.250000, 0.450787]
+      # - name: square_outer_ring_130_
+      #   fraction: [0.256152, 0.450787]
+      # - name: square_outer_ring_131_
+      #   fraction: [0.262303, 0.450787]
+      # - name: square_outer_ring_132_
+      #   fraction: [0.268455, 0.450787]
+      # - name: square_outer_ring_133_
+      #   fraction: [0.274606, 0.450787]
+      # 行 y=0.458
+      - name: structure_rear_grid_036
+        fraction: [0.286909, 0.450787]
+      - name: structure_rear_grid_037
+        fraction: [0.299213, 0.450787]
+      - name: structure_rear_grid_038
+        fraction: [0.311516, 0.450787]
+      - name: structure_rear_grid_039
+        fraction: [0.323819, 0.450787]
+      - name: structure_rear_grid_040
+        fraction: [0.336122, 0.450787]
+      - name: structure_rear_grid_041
+        fraction: [0.348425, 0.450787]
+      - name: structure_rear_grid_042
+        fraction: [0.360728, 0.450787]
+      # 行 y=0.433
+      - name: structure_rear_grid_043
+        fraction: [0.286909, 0.426181]
+      - name: structure_rear_grid_044
+        fraction: [0.299213, 0.426181]
+      - name: structure_rear_grid_045
+        fraction: [0.311516, 0.426181]
+      - name: structure_rear_grid_046
+        fraction: [0.323819, 0.426181]
+      - name: structure_rear_grid_047
+        fraction: [0.336122, 0.426181]
+      - name: structure_rear_grid_048
+        fraction: [0.348425, 0.426181]
+      - name: structure_rear_grid_049
+        fraction: [0.360728, 0.426181]
+      # base探针 5/5 - 结构物底部水平线 (structure bottom line) ，6 个点
+      - name: structure_bottom_line_001
+        fraction: [0.243848, 0.426181]
+      - name: structure_bottom_line_002
+        fraction: [0.250000, 0.426181]
+      - name: structure_bottom_line_003
+        fraction: [0.256152, 0.426181]
+      - name: structure_bottom_line_004
+        fraction: [0.262303, 0.426181]
+      - name: structure_bottom_line_005
+        fraction: [0.268455, 0.426181]
+      - name: structure_bottom_line_006
+        fraction: [0.274606, 0.426181]
